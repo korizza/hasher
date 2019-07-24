@@ -25,7 +25,6 @@ hasher::hasher(const std::string &in_file, const std::string &out_file, size_t b
         m_out_filename(out_file),
         m_blk_size(blk_size),
         m_calc_thread_num(calc_thread_num),
-        m_manager_loop(1),
         m_calc_pool(calc_thread_num), 
         m_write_loop(1)
 {
@@ -33,32 +32,6 @@ hasher::hasher(const std::string &in_file, const std::string &out_file, size_t b
 
 hasher::~hasher()
 {
-}
-
-// this worker function run in the single loop
-void hasher::manager_worker(job_list_ptr_t jobs)
-{
-    if (m_need_stop.load()) {
-        return;
-    }
-    
-    m_manager_calc_cntr.store(0);
-    unsigned int num_jobs = jobs->size();
-    
-    // calculating hashes in the calculating pool
-    for (auto &blk : *jobs) {
-        boost::asio::post(m_calc_pool, std::bind(&hasher::calc_worker, this, blk));
-    }
-    
-    // wait until all the jobs in the list are done
-    while ( (m_manager_calc_cntr.load() != num_jobs) && !m_need_stop.load()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    
-    // send results to the writer loop
-    for (auto &blk : *jobs) {
-        boost::asio::post(m_write_loop, std::bind(&hasher::write_worker, this, blk));
-    }        
 }
 
 void hasher::calc_worker(data_blk_ptr_t blk)
@@ -77,7 +50,7 @@ void hasher::calc_worker(data_blk_ptr_t blk)
     ++m_manager_calc_cntr;
 }
 
-void hasher::write_worker(data_blk_ptr_t blk)
+void hasher::write_worker(int crc)
 {
     if (m_need_stop.load()) {
         return;
@@ -85,17 +58,37 @@ void hasher::write_worker(data_blk_ptr_t blk)
     
     TRY_ALL {
 //        m_out_file.write(blk->data.get(), blk->size);
-        m_out_file << std::hex << std::setw(8) << std::setfill('0') << blk->crc << '\n';
+        m_out_file << std::hex << std::setw(8) << std::setfill('0') << crc << '\n';
 //        m_out_file.write(reinterpret_cast<char*>(&blk->crc), sizeof(int));
     } CATCH_ALL;    
 }
 
-void hasher::process_hashing(job_list_ptr_t jobs)
+void hasher::process_hashing(const job_vec_t &jobs, size_t jobs_to_calc)
 {
-    if (jobs->empty()) {
+    if (jobs_to_calc == 0) {
         return;
     }
-    boost::asio::post(m_manager_loop, std::bind(&hasher::manager_worker, this, jobs));
+    
+    if (m_need_stop.load()) {
+        return;
+    }
+    
+    m_manager_calc_cntr.store(0);
+    
+    // calculating hashes in the calculating pool
+    for (size_t i = 0; i < jobs_to_calc; ++i) {
+        boost::asio::post(m_calc_pool, std::bind(&hasher::calc_worker, this, jobs[i]));        
+    }
+    
+    // wait until all the jobs in the list are done
+    while ((m_manager_calc_cntr.load() != jobs_to_calc) && !m_need_stop.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    
+    // send results to the writer loop
+    for (size_t i = 0; i < jobs_to_calc; ++i) {
+        boost::asio::post(m_write_loop, std::bind(&hasher::write_worker, this, jobs[i]->crc));        
+    }
 }
 
 inline data_blk_ptr_t create_blk(std::shared_ptr<char> data, size_t size)
@@ -110,6 +103,15 @@ inline std::shared_ptr<char> alloc_data_buffer(size_t size)
 {
     // TODO: it would be nice using some fixed-size lock-free memory pool here
     return std::shared_ptr<char>(new char [size], [](char *buffer){delete [] buffer;});
+}
+
+inline job_vec_t alloc_job_vector(size_t vec_size, size_t blk_size)
+{
+    job_vec_t jobs_vec;    
+    for (size_t i = 0; i < vec_size; ++i) {
+        jobs_vec.push_back(create_blk(alloc_data_buffer(blk_size), blk_size));
+    }
+    return jobs_vec;
 }
 
 void hasher::run()
@@ -134,24 +136,26 @@ void hasher::run()
     std::cout << "Hashing started with block size: " << m_blk_size << ", on " << m_calc_thread_num << " threads\n";
     // reading and processing data
     bool done_hashing = false;
+    
+    job_vec_t jobs = alloc_job_vector(m_calc_thread_num, m_blk_size);
+    
     for (;;) {
-        job_list_ptr_t jobs = std::make_shared<job_list_t>();       
-        
-        while (!m_need_stop.load()) {
-            if (jobs->size() == m_calc_thread_num) {
+        size_t job_cntr = 0;
+        while (!m_need_stop.load()) {            
+            if (job_cntr == m_calc_thread_num) {
                 break;
             }
             
             TRY_ALL {            
-                std::shared_ptr<char> data = alloc_data_buffer(m_blk_size);
-                m_in_file.read(data.get(), m_blk_size);
+                m_in_file.read(jobs[job_cntr]->data.get(), m_blk_size);
                 if (m_in_file) {
-                    jobs->push_back(create_blk(data, m_blk_size));
+                    ++job_cntr;
                     continue;
                 } else if (m_in_file.gcount() > 0) {
                     std::shared_ptr<char> tail_data = alloc_data_buffer(m_in_file.gcount());
-                    memcpy(tail_data.get(), data.get(), m_in_file.gcount());                
-                    jobs->push_back(create_blk(tail_data, m_in_file.gcount()));
+                    jobs[job_cntr]->data = tail_data;
+                    jobs[job_cntr]->size = m_in_file.gcount();
+                    ++job_cntr;
                 }
             } CATCH_ALL;
             
@@ -163,14 +167,13 @@ void hasher::run()
             break;
         }
         
-        process_hashing(jobs);
+        process_hashing(jobs, job_cntr);
         if (done_hashing) {
             break;
         }
     }
     
     // joining pools
-    m_manager_loop.join();
     m_calc_pool.join();
     m_write_loop.join();
     

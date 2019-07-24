@@ -9,6 +9,7 @@
 #include <memory>
 #include <fstream>
 #include <atomic>
+#include <vector>
 
 namespace hs {
 
@@ -22,6 +23,7 @@ typedef boost::asio::thread_pool thread_pool_t;
 typedef std::shared_ptr<data_blk_t> data_blk_ptr_t;
 typedef std::list<data_blk_ptr_t> job_list_t;
 typedef std::shared_ptr<job_list_t> job_list_ptr_t;
+typedef std::vector<data_blk_ptr_t> job_vec_t;
 
 class hasher {
     
@@ -31,10 +33,9 @@ public:
     void run();    
     
 private:
-    void process_hashing(job_list_ptr_t jobs);
-    void manager_worker(job_list_ptr_t jobs);
+    void process_hashing(const job_vec_t &jobs, size_t jobs_to_calc);
     void calc_worker(data_blk_ptr_t blk);
-    void write_worker(data_blk_ptr_t blk);
+    void write_worker(int crc);
     
 private:
     // main hasher options
@@ -46,9 +47,7 @@ private:
     // file handlers
     std::ifstream m_in_file;
     std::ofstream m_out_file;
-    
-    // a manager loop, provides jobs for m_calc_pool
-    thread_pool_t m_manager_loop;
+
     // an atomic counter, counts jobsnumber  done in calc pool
     std::atomic_uint m_manager_calc_cntr;
     
