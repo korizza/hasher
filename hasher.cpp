@@ -13,10 +13,10 @@ namespace hs {
 #define CATCH_ALL                                                                   \
             catch (std::exception &ex) {                                            \
                 std::cerr << "An exception has occured: \"" << ex.what() << "\"\n"; \
-                m_need_stop.store(true);                                            \
+                m_need_stop.store(true, std::memory_order_release);                                            \
             } catch ( ... ) {                                                       \
                 std::cerr << "An undefined exception has occured\n";                \
-                m_need_stop.store(true);                                            \
+                m_need_stop.store(true, std::memory_order_release);                                            \
             }
 
 
@@ -36,7 +36,7 @@ hasher::~hasher()
 
 void hasher::calc_worker(data_blk_ptr_t blk)
 {
-    if (m_need_stop.load()) {
+    if (m_need_stop.load(std::memory_order_acquire)) {
         return;
     }
 
@@ -47,12 +47,12 @@ void hasher::calc_worker(data_blk_ptr_t blk)
         blk->crc = result.checksum();
     } CATCH_ALL;   
     
-    ++m_manager_calc_cntr;
+    m_manager_calc_cntr.fetch_add(1, std::memory_order_release);
 }
 
 void hasher::write_worker(int crc)
 {
-    if (m_need_stop.load()) {
+    if (m_need_stop.load(std::memory_order_acquire)) {
         return;
     }
     
@@ -69,21 +69,21 @@ void hasher::process_hashing(const job_vec_t &jobs, size_t jobs_to_calc)
         return;
     }
     
-    if (m_need_stop.load()) {
+    if (m_need_stop.load(std::memory_order_acquire)) {
         return;
     }
     
-    m_manager_calc_cntr.store(0);
+    m_manager_calc_cntr.store(0, std::memory_order_relaxed);
     
     // calculating hashes in the calculating pool
     for (size_t i = 0; i < jobs_to_calc; ++i) {
         boost::asio::post(m_calc_pool, std::bind(&hasher::calc_worker, this, jobs[i]));        
-    }
-    
-    // wait until all the jobs in the list are done
-    while ((m_manager_calc_cntr.load() != jobs_to_calc) && !m_need_stop.load()) {
+    }   
+
+    while ((m_manager_calc_cntr.load(std::memory_order_acquire) != jobs_to_calc) && 
+            !m_need_stop.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
+    }   
     
     // send results to the writer loop
     for (size_t i = 0; i < jobs_to_calc; ++i) {
@@ -118,7 +118,7 @@ void hasher::run()
 {
     auto start_time = std::chrono::steady_clock::now();
     
-    m_need_stop.store(false);    
+    m_need_stop.store(false, std::memory_order_relaxed);    
     
     // opening files
     m_in_file.open(m_in_filename);
@@ -141,7 +141,7 @@ void hasher::run()
     
     for (;;) {
         size_t job_cntr = 0;
-        while (!m_need_stop.load()) {            
+        while (!m_need_stop.load(std::memory_order_acquire)) {            
             if (job_cntr == m_calc_thread_num) {
                 break;
             }
